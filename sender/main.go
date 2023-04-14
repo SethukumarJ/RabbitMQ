@@ -1,102 +1,147 @@
-// ./sender/main.go
-
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/streadway/amqp"
 )
 
+// Define a struct to hold the message fields.
+type Message struct {
+	Name    string `json:"name"`
+	Email   string `json:"email"`
+	Message string `json:"message"`
+}
+
 func main() {
-	// Define RabbitMQ server URL.
-	amqpServerURL := ("amqp://guest:guest@localhost:5672/")
-
-	// Create a new RabbitMQ connection.
-	connectRabbitMQ, err := amqp.Dial(amqpServerURL)
+	// Connect to RabbitMQ server.
+	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to connect to RabbitMQ server: %v", err)
 	}
-	defer connectRabbitMQ.Close()
+	defer conn.Close()
 
-	// Let's start by opening a channel to our RabbitMQ
-	// instance over the connection we have already
-	// established.
-	channelRabbitMQ, err := connectRabbitMQ.Channel()
+	// Create a channel.
+	channel, err := conn.Channel()
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to open a channel: %v", err)
 	}
-	defer channelRabbitMQ.Close()
+	defer channel.Close()
 
-	// With the instance and declare Queues that we can
-	// publish and subscribe to.
-	// _, err = channelRabbitMQ.QueueDeclare(
-	// 	"QueueService1", // queue name
-	// 	true,            // durable
-	// 	false,           // auto delete
-	// 	false,           // exclusive
-	// 	false,           // no wait
-	// 	nil,             // arguments
-	// )
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	_, err = channelRabbitMQ.QueueDeclare(
-		"QueueService2", // queue name
-		true,            // durable
-		false,           // auto delete
-		false,           // exclusive
-		false,           // no wait
-		nil,             // arguments
+	// Declare a queue for sending messages.
+	sendQueue, err := channel.QueueDeclare(
+		"send_queue", // name
+		false,        // durable
+		false,        // delete when unused
+		false,        // exclusive
+		false,        // no-wait
+		nil,          // arguments
 	)
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to declare a queue for sending messages: %v", err)
 	}
+
+	// Declare a queue for receiving acknowledgements.
+	ackQueue, err := channel.QueueDeclare(
+		"ack_queue", // name
+		false,       // durable
+		false,       // delete when unused
+		false,       // exclusive
+		false,       // no-wait
+		nil,         // arguments
+	)
+	if err != nil {
+		log.Fatalf("Failed to declare a queue for receiving acknowledgements: %v", err)
+	}
+
+	// Start consuming acknowledgements.
+	ackMsgs, err := channel.Consume(
+		ackQueue.Name, // queue
+		"",            // consumer
+		true,          // auto-ack
+		false,         // exclusive
+		false,         // no-local
+		false,         // no-wait
+		nil,           // args
+	)
+	if err != nil {
+		log.Fatalf("Failed to register a consumer for acknowledgements: %v", err)
+	}
+	go func() {
+		for ack := range ackMsgs {
+			fmt.Println("Acknowledgement received:", string(ack.Body))
+		}
+	}()
 
 	// Create a new Fiber instance.
 	app := fiber.New()
 
-	// Add middleware.
-	app.Use(
-		logger.New(), // add simple logger
+// Handle incoming requests.
+app.Post("/", func(c *fiber.Ctx) error {
+	// Parse the JSON message from the request body.
+	var message Message
+	if err := json.Unmarshal(c.Body(), &message); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Failed to parse message.",
+		})
+	}
+
+	// Send the message to the consumer.
+	body, err := json.Marshal(message)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to encode message.",
+		})
+	}
+
+	err = channel.Publish(
+		"",             // exchange
+		sendQueue.Name, // routing key
+		false,          // mandatory
+		false,          // immediate
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        body,
+			ReplyTo:     ackQueue.Name,
+		},
 	)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to publish message.",
+		})
+	}
 
-	// Add route.
-	app.Get("/send", func(c *fiber.Ctx) error {
-		// Create a message to publish.
-		message := amqp.Publishing{
-			ContentType: "text/plain",
-			Body:        []byte(c.Query("msg")),
+	// Start a separate goroutine to wait for the acknowledgement.
+	done := make(chan bool, 1)
+	go func() {
+		select {
+		case <-time.After(2 * time.Second):
+			fmt.Println("Received your request, will be proceeded soon")
+			done <- true
+		case <-ackMsgs:
+			// Do nothing, as the acknowledgement has been received.
+			done <- false
 		}
+	}()
 
-		// // Attempt to publish a message to the queue.
-		// if err := channelRabbitMQ.Publish(
-		// 	"",              // exchange
-		// 	"QueueService1", // queue name
-		// 	false,           // mandatory
-		// 	false,           // immediate
-		// 	message,         // message to publish
-		// ); err != nil {
-		// 	return err
-		// }
+	// Wait for the acknowledgement or timeout.
+	if <-done {
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"message": "Received your request, will be proceeded soon",
+		})
+	}
 
-		// Attempt to publish a message to the queue.
-		if err := channelRabbitMQ.Publish(
-			"",              // exchange
-			"QueueService2", // queue name
-			false,           // mandatory
-			false,           // immediate
-			message,         // message to publish
-		); err != nil {
-			return err
-		}
-
-		return nil
+	// Respond with a success message.
+	return c.JSON(fiber.Map{
+		"message": "Message sent successfully.",
 	})
+})
 
-	// Start Fiber API server.
+
+	// Start the server.
 	log.Fatal(app.Listen(":3939"))
 }
