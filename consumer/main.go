@@ -44,6 +44,7 @@ func main() {
 		log.Fatalf("Failed to declare a queue for receiving messages: %v", err)
 	}
 
+
 	// Start consuming messages.
 	msgs, err := channel.Consume(
 		queue.Name, // queue
@@ -58,6 +59,21 @@ func main() {
 		log.Fatalf("Failed to register a consumer: %v", err)
 	}
 
+		// Declare a queue for receiving messages.
+		queue1, err := channel.QueueDeclare(
+			"ak_que", // name
+			false,        // durable
+			false,        // delete when unused
+			false,        // exclusive
+			false,        // no-wait
+			nil,          // arguments
+		)
+		if err != nil {
+			log.Fatalf("Failed to declare a queue for receiving messages: %v", err,queue1)
+		}
+	
+		
+	
 	// Loop through incoming messages.
 	for msg := range msgs {
 		// Parse the JSON message.
@@ -98,8 +114,24 @@ func main() {
 			msg.Nack(false, false)
 			continue
 		}
+		err = channel.Publish(
+			"",          // exchange
+			"ak_que", // routing key
+			false,       // mandatory
+			false,       // immediate
+			amqp.Publishing{
+				ContentType: "application/json",
+				Body:        body,
+			},
+		)
+		if err != nil {
+			log.Printf("Failed to send acknowledgment: %v", err)
+			msg.Nack(false, false)
+			continue
+		}
 
 		// Acknowledge the message.
 		msg.Ack(false)
 	}
+	
 }

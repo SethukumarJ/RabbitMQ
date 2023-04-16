@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"net/http"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gin-gonic/gin"
 	"github.com/streadway/amqp"
 )
+
+
+var Communication bool
 
 // Define a struct to hold the message fields.
 type Message struct {
@@ -17,9 +23,18 @@ type Message struct {
 	Message string `json:"message"`
 }
 
-func main() {
+func getRabbitMQConnection() (*amqp.Connection, error) {
 	// Connect to RabbitMQ server.
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to RabbitMQ server: %v", err)
+	}
+	return conn, nil
+}
+
+func main() {
+	// Connect to RabbitMQ server.
+	conn, err := getRabbitMQConnection()
 	if err != nil {
 		log.Fatalf("Failed to connect to RabbitMQ server: %v", err)
 	}
@@ -71,33 +86,43 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to register a consumer for acknowledgements: %v", err)
 	}
-	go func() {
-		for ack := range ackMsgs {
-			fmt.Println("Acknowledgement received:", string(ack.Body))
-		}
+
+	// Create a new Gin instance.
+	r := gin.Default()
+
+	// Register the routes.
+	registerRoutes(r, channel, sendQueue, ackQueue, ackMsgs)
+
+	// Start the server.
+	go func (){
+	log.Fatal(r.Run(":3939"))
 	}()
+	// Generate a POST request to the route.
+	requestBody := []byte(`{"message": "hello world"}`)
+	resp, err := http.Post("http://localhost:3939", "application/json", bytes.NewBuffer(requestBody))
+	if err != nil {
+		log.Fatalf("Failed to send request: %v", err)
+	}
+	defer resp.Body.Close()
 
-	// Create a new Fiber instance.
-	app := fiber.New()
-
-// Handle incoming requests.
-app.Post("/", func(c *fiber.Ctx) error {
-	// Parse the JSON message from the request body.
-	var message Message
-	if err := json.Unmarshal(c.Body(), &message); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Failed to parse message.",
-		})
+	// Read the response body.
+	responseBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatalf("Failed to read response: %v", err)
 	}
 
-	// Send the message to the consumer.
+	// Print the response body.
+	fmt.Println(string(responseBody))
+}
+
+func sendMessage(channel *amqp.Channel, sendQueue amqp.Queue, message Message, ackQueueName string) error {
+	// Encode the message as JSON.
 	body, err := json.Marshal(message)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to encode message.",
-		})
+		return err
 	}
 
+	// Publish the message to the queue.
 	err = channel.Publish(
 		"",             // exchange
 		sendQueue.Name, // routing key
@@ -106,42 +131,49 @@ app.Post("/", func(c *fiber.Ctx) error {
 		amqp.Publishing{
 			ContentType: "application/json",
 			Body:        body,
-			ReplyTo:     ackQueue.Name,
+			ReplyTo:     ackQueueName,
 		},
 	)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to publish message.",
-		})
+		return err
 	}
 
-	// Start a separate goroutine to wait for the acknowledgement.
-	done := make(chan bool, 1)
-	go func() {
+	return nil
+}
+
+func registerRoutes(router *gin.Engine, channel *amqp.Channel, sendQueue amqp.Queue, ackQueue amqp.Queue, ackMsgs <-chan amqp.Delivery) {
+	// Handle incoming requests.
+	router.POST("/", func(c *gin.Context) {
+		// Parse the JSON message from the request body.
+		var message Message
+		if err := c.BindJSON(&message); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "Failed to parse message.",
+			})
+			return
+		}
+
+		// Send the message to the consumer.
+		err := sendMessage(channel, sendQueue, message, ackQueue.Name)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to publish message.",
+			})
+			return
+		}
+
+		// Wait for the acknowledgement or timeout.
 		select {
 		case <-time.After(2 * time.Second):
-			fmt.Println("Received your request, will be proceeded soon")
-			done <- true
+			fmt.Println("Your response has been received, processed soon!")
+			c.JSON(http.StatusOK, gin.H{
+				"message": "No acknowledgement received.",
+			})
 		case <-ackMsgs:
-			// Do nothing, as the acknowledgement has been received.
-			done <- false
+			fmt.Println("Acknowledgement received:")
+			c.JSON(http.StatusOK, gin.H{
+				"message": "Acknowledgement received.",
+			})
 		}
-	}()
-
-	// Wait for the acknowledgement or timeout.
-	if <-done {
-		return c.Status(fiber.StatusOK).JSON(fiber.Map{
-			"message": "Received your request, will be proceeded soon",
-		})
-	}
-
-	// Respond with a success message.
-	return c.JSON(fiber.Map{
-		"message": "Message sent successfully.",
 	})
-})
-
-
-	// Start the server.
-	log.Fatal(app.Listen(":3939"))
 }
